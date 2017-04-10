@@ -351,6 +351,42 @@ func (m *Master) Wait(args *QueryArgs, reply *QueryReply) error {
 	return m.proxyQuery("Wait", args.ID, args, reply)
 }
 
+type WaitAnyArgs struct {
+	IDs []string `json:"ids"`
+}
+
+type WaitAnyReply struct {
+	ID     string      `json:"id"`
+	Status *QueryReply `json:"status"`
+}
+
+func (m *Master) WaitAny(args *WaitAnyArgs, reply *WaitAnyReply) error {
+	if len(args.IDs) == 0 {
+		return errors.New("require at least 1 id to wait")
+	}
+	// chech for process existence
+	for _, id := range args.IDs {
+		if err := m.Query(&QueryArgs{ID: id}, new(QueryReply)); err != nil {
+			return err
+		}
+	}
+	donechan := make(chan *rpc.Call, len(args.IDs))
+	for _, id := range args.IDs {
+		var hostname string
+		var subid int
+		split2(id, ".", &hostname, &subid)
+		node := m.Nodes[hostname]
+		node.rpc.Go("NodeWorker.Wait", &QueryArgs{ID: id}, new(QueryReply), donechan)
+	}
+	firstReturningCall := <-donechan
+	if firstReturningCall.Error != nil {
+		return firstReturningCall.Error
+	}
+	reply.ID = firstReturningCall.Args.(*QueryArgs).ID
+	reply.Status = firstReturningCall.Reply.(*QueryReply)
+	return nil
+}
+
 func getNodesFromMachineFile(filename string) map[string]*Node {
 	file, err := os.Open(filename)
 	if err != nil {

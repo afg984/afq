@@ -52,8 +52,8 @@ class RPCClinet(object):
                 'method': command,
                 'params': [kwargs],
                 'id': id
-            }) +
-            '\n'
+            }).encode() +
+            b'\n'
         )
         receiver.event.wait()
         return receiver.value
@@ -141,3 +141,13 @@ class Master(object):
         '''
         result = self.rpc.call('Master.Wait', id=id)
         return ProcessStatus(**result)
+
+    def waitany(self, *ids):
+        '''
+        wait for multiple processes with the corresponding ids to exit.
+        returns a tuple (id, status)
+        id: the first exiting process' id
+        status: ProcessStatus
+        '''
+        result = self.rpc.call('Master.WaitAny', ids=ids)
+        return result['id'], ProcessStatus(**result['status'])
