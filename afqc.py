@@ -87,7 +87,7 @@ class Master(object):
     '''
     Client to talk to afq
     '''
-    def __init__(self, host, port):
+    def __init__(self, host, port=6666):
         self.rpc = RPCClinet(host, port)
 
     def query(self, id):
