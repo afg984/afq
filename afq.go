@@ -306,10 +306,11 @@ func (m *Master) Launch(args *LaunchArgs, reply *LaunchReply) error {
 		requestedCPUs = 1
 	}
 	for _, node := range m.Nodes {
-		if requestedCPUs+node.busyCPUs < node.CPUs {
+		if requestedCPUs+node.busyCPUs <= node.CPUs {
 			err := node.rpc.Call("NodeWorker.Launch", args, reply)
-			if err != nil {
+			if err == nil {
 				node.busyCPUs += requestedCPUs
+				log.Printf("%v CPU utilization %v/%v", node.Name, node.busyCPUs, node.CPUs)
 				go func() {
 					var qreply QueryReply
 					node.rpc.Call(
