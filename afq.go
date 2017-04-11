@@ -62,18 +62,20 @@ func newTrackedProcess(startedCommand *exec.Cmd) *trackedProcess {
 	go func() {
 		err := startedCommand.Wait()
 		tp.exited = true
-		close(tp.waitExited)
 		if err == nil {
 			tp.exitStatus = 0
+			close(tp.waitExited)
 			log.Println("process", tp.cmd.Process.Pid, "exited successfully")
 		} else {
 			if exiterr, ok := err.(*exec.ExitError); ok {
 				if waitStatus, ok := exiterr.Sys().(syscall.WaitStatus); ok {
 					tp.exitStatus = waitStatus.ExitStatus()
+					close(tp.waitExited)
 					log.Println("process", tp.cmd.Process.Pid, "exited with status", tp.exitStatus)
 					return
 				}
 			}
+			close(tp.waitExited)
 			log.Fatalf("unexpected error for %v, %v", startedCommand, err)
 		}
 	}()
