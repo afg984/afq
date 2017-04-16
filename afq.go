@@ -21,10 +21,12 @@ import (
 var port int
 var nodename string
 var nodetimeout time.Duration
+var nodecwd string
 
 func init() {
 	flag.IntVar(&port, "port", 6666, "the port the server is supposed to be running on")
 	flag.DurationVar(&nodetimeout, "nodetimeout", time.Second*10, "time waiting for node to start")
+	flag.StringVar(&nodecwd, "nodecwd", ".", "node working directory")
 	var err error
 	nodename, err = os.Hostname()
 	if err != nil {
@@ -242,6 +244,10 @@ func rpcMain(rcvrs ...interface{}) {
 }
 
 func nodeWorkerMain() {
+	err := os.Chdir(nodecwd)
+	if err != nil {
+		log.Fatalf("fatal: error changing directory %v", err)
+	}
 	log.Println("node running at port", port)
 	rpcMain(NewNodeWorker())
 }
@@ -265,10 +271,14 @@ func (node *Node) startWorker() {
 	}
 	if node.Name != localname {
 		// maybe implement using ssh library sometime
-		sshCmd := exec.Command("ssh", "-t", "-t", node.Name, "--", abspath, "node")
+		wd, err := os.Getwd()
+		if err != nil {
+			log.Fatalf("fatal: getwd %v", err)
+		}
+		sshCmd := exec.Command("ssh", "-t", "-t", node.Name, "--", abspath, "node", "-nodecwd", wd)
 		sshCmd.Stdout = os.Stdout
 		sshCmd.Stderr = os.Stderr
-		err := sshCmd.Start()
+		err = sshCmd.Start()
 		if err != nil {
 			log.Fatalln("fatal:", err)
 		}
