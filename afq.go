@@ -12,23 +12,29 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 )
 
 var port int
+var isNode bool
 var nodename string
 var nodetimeout time.Duration
 var nodecwd string
+var executable string
 
 func init() {
 	flag.IntVar(&port, "port", 6666, "the port the server is supposed to be running on")
 	flag.DurationVar(&nodetimeout, "nodetimeout", time.Second*10, "time waiting for node to start")
 	flag.StringVar(&nodecwd, "nodecwd", ".", "node working directory")
+	flag.BoolVar(&isNode, "node", false, "run node worker")
 	var err error
 	nodename, err = os.Hostname()
+	if err != nil {
+		log.Fatalln("fatal:", err)
+	}
+	executable, err = os.Executable()
 	if err != nil {
 		log.Fatalln("fatal:", err)
 	}
@@ -261,10 +267,6 @@ type Node struct {
 }
 
 func (node *Node) startWorker() {
-	abspath, err := filepath.Abs(os.Args[0])
-	if err != nil {
-		log.Fatalln("fatal:", err)
-	}
 	localname, err := os.Hostname()
 	if err != nil {
 		log.Fatalln("fatal:", err)
@@ -275,7 +277,7 @@ func (node *Node) startWorker() {
 		if err != nil {
 			log.Fatalf("fatal: getwd %v", err)
 		}
-		sshCmd := exec.Command("ssh", "-t", "-t", node.Name, "--", abspath, "node", "-nodecwd", wd)
+		sshCmd := exec.Command("ssh", "-t", "-t", node.Name, "--", executable, "-node", "-nodecwd", wd)
 		sshCmd.Stdout = os.Stdout
 		sshCmd.Stderr = os.Stderr
 		err = sshCmd.Start()
@@ -452,15 +454,9 @@ func main() {
 	log.SetFlags(log.Ltime | log.Lshortfile)
 	log.SetPrefix(nodename + " ")
 	flag.Parse()
-	if len(os.Args) < 2 {
-		log.Fatalf("usage: %v {master,node}", os.Args[0])
-	}
-	command := os.Args[1]
-	if command == "master" {
-		masterMain()
-	} else if command == "node" {
+	if isNode {
 		nodeWorkerMain()
 	} else {
-		log.Fatal("unknown command: ", command)
+		masterMain()
 	}
 }
