@@ -452,7 +452,7 @@ func main() {
 	log.SetFlags(log.Ltime | log.Lshortfile)
 	log.SetPrefix(nodename + " ")
 	flag.Parse()
-	if len(os.Args) != 2 {
+	if len(os.Args) < 2 {
 		log.Fatalf("usage: %v {master,node}", os.Args[0])
 	}
 	command := os.Args[1]
