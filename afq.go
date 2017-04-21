@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"container/heap"
 	"errors"
 	"flag"
 	"fmt"
@@ -12,6 +13,8 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -92,6 +95,7 @@ func newTrackedProcess(startedCommand *exec.Cmd) *trackedProcess {
 	return tp
 }
 
+// NodeWorker -- process manager running on nodes
 type NodeWorker struct {
 	name            string
 	processMap      map[string]*trackedProcess
@@ -99,6 +103,7 @@ type NodeWorker struct {
 	counter         int32
 }
 
+// NewNodeWorker returns a initialized NodeWorker
 func NewNodeWorker() *NodeWorker {
 	nw := &NodeWorker{
 		name:       nodename,
@@ -107,29 +112,36 @@ func NewNodeWorker() *NodeWorker {
 	return nw
 }
 
+// newProcessID returns a unique process id for the node
 func (nw *NodeWorker) newProcessID() string {
 	return fmt.Sprintf("%v.%v", nw.name, atomic.AddInt32(&nw.counter, 1))
 }
 
+// getProcess returns a trackedProcess in node.processMap
 func (nw *NodeWorker) getProcess(id string) (process *trackedProcess, ok bool) {
 	nw.processMapMutex.RLock()
 	process, ok = nw.processMap[id]
 	nw.processMapMutex.RUnlock()
+	return
 }
 
-type LaunchArgs struct {
+// NodeLaunchArgs -- the command, arguments, environment, working directory of the command
+type NodeLaunchArgs struct {
 	Name string   `json:"name"`
 	Args []string `json:"args"`
 	Env  []string `json:"env"`
 	Cwd  string   `json:"cwd"`
-	CPUs int      `json:"ncpu"`
 }
 
-type LaunchReply struct {
+// NodeLaunchReply -- the reply of launching on a node
+type NodeLaunchReply struct {
+	// The ID of the process on the node,
+	// this is unlikely to be the same as the ID on the master
 	ID string `json:"id"`
 }
 
-func (nw *NodeWorker) Launch(args *LaunchArgs, reply *LaunchReply) error {
+// Launch a process on the node worker, returning the ID
+func (nw *NodeWorker) Launch(args *NodeLaunchArgs, reply *NodeLaunchReply) error {
 	cmd := exec.Command(args.Name, args.Args...)
 	cmd.Env = args.Env
 	cmd.Dir = args.Cwd
@@ -158,10 +170,12 @@ func (nw *NodeWorker) Launch(args *LaunchArgs, reply *LaunchReply) error {
 	return nil
 }
 
+// QueryArgs -- arguments to perform Query and Wait
 type QueryArgs struct {
 	ID string `json:"id"`
 }
 
+// QueryReply -- result of Query and Wait
 type QueryReply struct {
 	Exited     bool `json:"exited"`
 	ExitStatus int  `json:"exit_status"`
@@ -180,6 +194,7 @@ func (nw *NodeWorker) findProcess(id string) (*trackedProcess, error) {
 	return tp, nil
 }
 
+// Query a process by its ID, return its state and exit status
 func (nw *NodeWorker) Query(args *QueryArgs, reply *QueryReply) error {
 	tp, err := nw.findProcess(args.ID)
 	if err != nil {
@@ -189,6 +204,7 @@ func (nw *NodeWorker) Query(args *QueryArgs, reply *QueryReply) error {
 	return nil
 }
 
+// Wait for a process to exit, by its ID, return its state and exit status
 func (nw *NodeWorker) Wait(args *QueryArgs, reply *QueryReply) error {
 	tp, err := nw.findProcess(args.ID)
 	if err != nil {
@@ -199,11 +215,13 @@ func (nw *NodeWorker) Wait(args *QueryArgs, reply *QueryReply) error {
 	return nil
 }
 
+// SignalArgs -- Signal of Arguments of Signal
 type SignalArgs struct {
 	ID     string
 	Signal int
 }
 
+// Signal a process by its ID and signal number, return its state and exit status
 func (nw *NodeWorker) Signal(args *SignalArgs, reply *QueryReply) error {
 	tp, err := nw.findProcess(args.ID)
 	if err != nil {
@@ -263,12 +281,51 @@ func nodeWorkerMain() {
 	rpcMain(NewNodeWorker())
 }
 
+// Resource represents CPU, memory, etc
+type Resource struct {
+	max       int
+	available int
+	sync.Mutex
+}
+
+// NewResource creates a new Resource with the specified number of units
+func NewResource(max int) *Resource {
+	return &Resource{max: max, available: max}
+}
+
+// Max returns the maximum number of resource
+func (r *Resource) Max() int {
+	return r.max
+}
+
+// TestAcquire tests whtehter the requested amount of resource is available
+// if yes, acquires the resource
+// returns whether the resource is acquired and the amount remaining
+func (r *Resource) TestAcquire(amount int) (bool, int) {
+	r.Lock()
+	defer r.Unlock()
+	if r.available >= amount {
+		r.available -= amount
+		return true, r.available
+	}
+	return false, r.available
+}
+
+// Release the specified amount of resource, returns the amount available
+func (r *Resource) Release(amount int) (remaining int) {
+	r.Lock()
+	r.available += amount
+	remaining = r.available
+	r.Unlock()
+	return
+}
+
+// Node -- master abstraction of a node worker
 type Node struct {
-	Name     string
-	CPUs     int
-	busyCPUs int
-	rpc      *rpc.Client
-	sshCmd   *exec.Cmd
+	Name   string
+	cpu    *Resource
+	rpc    *rpc.Client
+	sshCmd *exec.Cmd
 }
 
 func (node *Node) startWorker() {
@@ -315,105 +372,260 @@ func (node *Node) stopWorker() {
 	}
 }
 
-type Master struct {
-	Nodes map[string]*Node
+// masterProcess -- abstraction of a tracked process on the master
+type masterProcess struct {
+	args       *LaunchArgs
+	node       *Node
+	remoteID   string
+	launched   chan struct{} // channel, closed after the process is launched
+	exited     chan struct{} // channel, closed after the process is exited
+	exitStatus int
 }
 
-func (m *Master) Launch(args *LaunchArgs, reply *LaunchReply) error {
-	requestedCPUs := args.CPUs
-	if requestedCPUs < 1 {
-		requestedCPUs = 1
+func newMasterProcess(args *LaunchArgs) *masterProcess {
+	return &masterProcess{
+		args:       args,
+		launched:   make(chan struct{}),
+		exited:     make(chan struct{}),
+		exitStatus: -1,
 	}
-	for _, node := range m.Nodes {
-		if requestedCPUs+node.busyCPUs <= node.CPUs {
-			err := node.rpc.Call("NodeWorker.Launch", args, reply)
-			if err == nil {
-				node.busyCPUs += requestedCPUs
-				log.Printf("%v CPU utilization %v/%v", node.Name, node.busyCPUs, node.CPUs)
-				go func() {
-					var qreply QueryReply
-					node.rpc.Call(
-						"NodeWorker.Wait",
-						&QueryArgs{ID: reply.ID},
-						&qreply)
-					node.busyCPUs -= requestedCPUs
-				}()
-			}
-			return err
+}
+
+func (process *masterProcess) runOn(node *Node) {
+	process.node = node
+	var launchReply NodeLaunchReply
+	err := node.rpc.Call("NodeWorker.Launch", process.args.NodeLaunchArgs, &launchReply)
+	if err != nil {
+		panic(err)
+	}
+	process.remoteID = launchReply.ID
+	close(process.launched)
+
+	var waitReply QueryReply
+	err = node.rpc.Call("NodeWorker.Wait", QueryArgs{ID: launchReply.ID}, &waitReply)
+	if err != nil {
+		panic(err)
+	}
+	remaining := node.cpu.Release(process.args.CPUs)
+	log.Printf("node %v process exited, cpu: %v/%v", node.Name, remaining, node.cpu.Max())
+	process.exitStatus = waitReply.ExitStatus
+	close(process.exited)
+}
+
+type masterProcessQueueInterface []*masterProcess
+
+func (q masterProcessQueueInterface) Len() int { return len(q) }
+
+func (q masterProcessQueueInterface) Less(i, j int) bool {
+	return q[i].args.CPUs < q[j].args.CPUs
+}
+
+func (q masterProcessQueueInterface) Swap(i, j int) {
+	q[i], q[j] = q[j], q[i]
+}
+
+func (q *masterProcessQueueInterface) Push(x interface{}) {
+	typed := x.(*masterProcess)
+	*q = append(*q, typed)
+}
+
+func (q *masterProcessQueueInterface) Pop() interface{} {
+	old := *q
+	n := old.Len()
+	item := old[n-1]
+	*q = old[0 : n-1]
+	return item
+}
+
+type masterProcessQueue struct {
+	data           masterProcessQueueInterface
+	enqueueRequest chan *masterProcess
+	dequeueRequest chan chan *masterProcess
+}
+
+func newMasterProcessQueue() (q *masterProcessQueue) {
+	q = &masterProcessQueue{
+		enqueueRequest: make(chan *masterProcess),
+		dequeueRequest: make(chan chan *masterProcess),
+	}
+	go func() {
+		push := func(process *masterProcess) {
+			heap.Push(&q.data, process)
+			log.Printf("enqueued job: %v, in queue: %v", process.args.Name, q.data.Len())
 		}
-	}
-	return errors.New("No idle CPU available")
+		for {
+			if q.data.Len() == 0 {
+				push(<-q.enqueueRequest)
+			} else {
+				select {
+				case process := <-q.enqueueRequest:
+					push(process)
+				case popchan := <-q.dequeueRequest:
+					popchan <- heap.Pop(&q.data).(*masterProcess)
+				}
+			}
+		}
+	}()
+	return
 }
 
-func (m *Master) proxyQuery(serviceMethod string, id string, args interface{}, reply *QueryReply) error {
-	var hostname string
-	var subid int
-	err := split2(id, ".", &hostname, &subid)
+func (q *masterProcessQueue) Enqueue(process *masterProcess) {
+	q.enqueueRequest <- process
+}
+
+func (q *masterProcessQueue) Dequeue() *masterProcess {
+	resultChan := make(chan *masterProcess)
+	q.dequeueRequest <- resultChan
+	return <-resultChan
+}
+
+// Master -- RPC Master
+type Master struct {
+	nodes            []*Node
+	processes        []*masterProcess
+	processArrayLock sync.RWMutex
+	queue            *masterProcessQueue
+}
+
+// LaunchArgs -- arguments to Master.Launch
+type LaunchArgs struct {
+	NodeLaunchArgs
+	CPUs int `json:"ncpu"`
+}
+
+// LaunchReply -- result of Master.Launch
+type LaunchReply struct {
+	// The ID on the master, this is unlikely to be the same as the one on the node
+	ID string `json:"id"`
+}
+
+// Submit a process
+func (m *Master) Submit(args *LaunchArgs, reply *LaunchReply) error {
+	if args.CPUs < 1 {
+		args.CPUs = 1
+	}
+	process := newMasterProcess(args)
+	m.processArrayLock.Lock()
+	reply.ID = fmt.Sprint(len(m.processes))
+	m.processes = append(m.processes, process)
+	m.processArrayLock.Unlock()
+	m.queue.Enqueue(process)
+	return nil
+}
+
+// getProcess -- get the process of the given id
+func (m *Master) findProcess(id string) (*masterProcess, error) {
+	m.processArrayLock.Lock()
+	defer m.processArrayLock.Unlock()
+	index, err := strconv.ParseInt(id, 10, 32)
+	if err != nil {
+		return nil, err
+	}
+	if int(index) < len(m.processes) {
+		return m.processes[index], nil
+	}
+	return nil, fmt.Errorf("No such process: %v", id)
+}
+
+// Query the process
+func (m *Master) Query(args *QueryArgs, reply *QueryReply) error {
+	process, err := m.findProcess(args.ID)
 	if err != nil {
 		return err
 	}
-	node, ok := m.Nodes[hostname]
-	if !ok {
-		return fmt.Errorf("No such node: %q", hostname)
+	select {
+	case <-process.exited:
+		reply.Exited = true
+		reply.ExitStatus = process.exitStatus
+	default:
+		reply.Exited = false
+		reply.ExitStatus = -1
 	}
-	return node.rpc.Call("NodeWorker."+serviceMethod, args, reply)
+	return nil
 }
 
-func (m *Master) Query(args *QueryArgs, reply *QueryReply) error {
-	return m.proxyQuery("Query", args.ID, args, reply)
-}
-
+// Signal -- send a signal to the process
 func (m *Master) Signal(args *SignalArgs, reply *QueryReply) error {
-	return m.proxyQuery("Signal", args.ID, args, reply)
+	process, err := m.findProcess(args.ID)
+	if err != nil {
+		return err
+	}
+	select {
+	case <-process.launched:
+		return process.node.rpc.Call(
+			"NodeWorker.Signal",
+			SignalArgs{
+				ID:     process.remoteID,
+				Signal: args.Signal,
+			},
+			reply,
+		)
+	default:
+		return errors.New("process has not yet been started")
+	}
 }
 
+// Wait for a process to exit, returning its status
 func (m *Master) Wait(args *QueryArgs, reply *QueryReply) error {
-	return m.proxyQuery("Wait", args.ID, args, reply)
+	process, err := m.findProcess(args.ID)
+	if err != nil {
+		return err
+	}
+	<-process.exited
+	reply.Exited = true
+	reply.ExitStatus = process.exitStatus
+	return nil
 }
 
+// WaitAnyArgs -- argument for Master.WaitAny
 type WaitAnyArgs struct {
 	IDs []string `json:"ids"`
 }
 
+// WaitAnyReply -- argument for Master.WaitAny
 type WaitAnyReply struct {
-	ID     string      `json:"id"`
-	Status *QueryReply `json:"status"`
+	ID     string     `json:"id"`
+	Status QueryReply `json:"status"`
 }
 
+// WaitAny waits for any process to exit
+// ids should be a array containing at least one id
+// if any id specified in ids is invalid, errors.
 func (m *Master) WaitAny(args *WaitAnyArgs, reply *WaitAnyReply) error {
 	if len(args.IDs) == 0 {
 		return errors.New("require at least 1 id to wait")
 	}
 	// chech for process existence
-	for _, id := range args.IDs {
-		if err := m.Query(&QueryArgs{ID: id}, new(QueryReply)); err != nil {
+	cases := make([]reflect.SelectCase, len(args.IDs))
+	for index, id := range args.IDs {
+		var err error
+		process, err := m.findProcess(id)
+		if err != nil {
 			return err
 		}
+		cases[index] = reflect.SelectCase{
+			Dir:  reflect.SelectRecv,
+			Chan: reflect.ValueOf(process.exited),
+		}
 	}
-	donechan := make(chan *rpc.Call, len(args.IDs))
-	for _, id := range args.IDs {
-		var hostname string
-		var subid int
-		split2(id, ".", &hostname, &subid)
-		node := m.Nodes[hostname]
-		node.rpc.Go("NodeWorker.Wait", &QueryArgs{ID: id}, new(QueryReply), donechan)
+	index, _, _ := reflect.Select(cases)
+	completedID := args.IDs[index]
+	process, err := m.findProcess(completedID)
+	if err != nil {
+		panic(err)
 	}
-	firstReturningCall := <-donechan
-	if firstReturningCall.Error != nil {
-		return firstReturningCall.Error
-	}
-	reply.ID = firstReturningCall.Args.(*QueryArgs).ID
-	reply.Status = firstReturningCall.Reply.(*QueryReply)
+	reply.ID = completedID
+	reply.Status.Exited = true
+	reply.Status.ExitStatus = process.exitStatus
 	return nil
 }
 
-func getNodesFromMachineFile(filename string) map[string]*Node {
+func getNodesFromMachineFile(filename string) (result []*Node) {
 	file, err := os.Open(filename)
 	if err != nil {
 		log.Fatalln("fatal:", err)
 	}
 	defer file.Close()
-	result := make(map[string]*Node)
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		parts := strings.SplitN(scanner.Text(), ":", 2)
@@ -426,31 +638,65 @@ func getNodesFromMachineFile(filename string) map[string]*Node {
 		if err != nil {
 			log.Fatalf("bad word (cpus): %q", scanner.Text())
 		}
-		result[hostname] = &Node{
+		result = append(result, &Node{
 			Name: hostname,
-			CPUs: cpucount,
-		}
+			cpu:  NewResource(cpucount),
+		})
 	}
 	if err := scanner.Err(); err != nil {
 		log.Fatalf("Error reading input: %v", err)
 	}
-	return result
+	return
+}
+
+func (m *Master) launchLoop() {
+	recheck := make(chan struct{}, 1)
+	notify := func() {
+		select {
+		case recheck <- struct{}{}:
+		default:
+		}
+	}
+	for {
+		process := m.queue.Dequeue()
+		notify()
+		for _ = range recheck {
+			for _, node := range m.nodes {
+				acquired, remaining := node.cpu.TestAcquire(process.args.CPUs)
+				if acquired {
+					log.Printf("launch on %s, cpu: %v/%v", node.Name, remaining, node.cpu.Max())
+					go func() {
+						// release of resource is done in runOn()
+						process.runOn(node)
+						notify()
+					}()
+					goto doNext
+				}
+			}
+		}
+	doNext:
+	}
 }
 
 func masterMain() {
-	var master Master
-	master.Nodes = getNodesFromMachineFile("machinefile")
+	master := Master{
+		nodes: getNodesFromMachineFile("machinefile"),
+		queue: newMasterProcessQueue(),
+	}
 	go rpcMain(&master, NewNodeWorker())
-	for _, node := range master.Nodes {
+
+	for _, node := range master.nodes {
 		node.startWorker()
 	}
 	log.Println("master running at port", port)
+
+	go master.launchLoop()
 
 	sigchan := make(chan os.Signal, 1)
 	signal.Notify(sigchan, os.Interrupt)
 	<-sigchan
 	fmt.Println("received Ctrl+C, quitting")
-	for _, node := range master.Nodes {
+	for _, node := range master.nodes {
 		node.stopWorker()
 	}
 }

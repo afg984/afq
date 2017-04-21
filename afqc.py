@@ -98,9 +98,9 @@ class Master(object):
         result = self.rpc.call('Master.Query', id=id)
         return ProcessStatus(**result)
 
-    def launch(self, *args, **kwargs):
+    def submit(self, *args, **kwargs):
         '''
-        launch a process
+        submit a process
 
         *args: the command to run
         cwd: working directory.
@@ -116,7 +116,7 @@ class Master(object):
         ncpu = kwargs.get('ncpu', 1)
         env = ['%s=%s' % (k, v) for (k, v) in env.items()]
         result = self.rpc.call(
-            'Master.Launch',
+            'Master.Submit',
             name=args[0],
             args=args[1:],
             cwd=cwd,
