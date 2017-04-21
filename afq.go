@@ -485,6 +485,7 @@ type Master struct {
 	processes        []*masterProcess
 	processArrayLock sync.RWMutex
 	queue            *masterProcessQueue
+	maxCPUPerNode    int
 }
 
 // LaunchArgs -- arguments to Master.Launch
@@ -503,6 +504,8 @@ type LaunchReply struct {
 func (m *Master) Submit(args *LaunchArgs, reply *LaunchReply) error {
 	if args.CPUs < 1 {
 		args.CPUs = 1
+	} else if args.CPUs > m.maxCPUPerNode {
+		return fmt.Errorf("reqested ncpu=%v exceeds node maximum: %v", args.CPUs, m.maxCPUPerNode)
 	}
 	process := newMasterProcess(args)
 	m.processArrayLock.Lock()
@@ -687,6 +690,9 @@ func masterMain() {
 
 	for _, node := range master.nodes {
 		node.startWorker()
+		if node.cpu.Max() > master.maxCPUPerNode {
+			master.maxCPUPerNode = node.cpu.Max()
+		}
 	}
 	log.Println("master running at port", port)
 
