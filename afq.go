@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -92,21 +93,28 @@ func newTrackedProcess(startedCommand *exec.Cmd) *trackedProcess {
 }
 
 type NodeWorker struct {
-	name      string
-	processes map[string]*trackedProcess
-	counter   int32
+	name            string
+	processMap      map[string]*trackedProcess
+	processMapMutex sync.RWMutex
+	counter         int32
 }
 
 func NewNodeWorker() *NodeWorker {
 	nw := &NodeWorker{
-		name:      nodename,
-		processes: make(map[string]*trackedProcess),
+		name:       nodename,
+		processMap: make(map[string]*trackedProcess),
 	}
 	return nw
 }
 
 func (nw *NodeWorker) newProcessID() string {
 	return fmt.Sprintf("%v.%v", nw.name, atomic.AddInt32(&nw.counter, 1))
+}
+
+func (nw *NodeWorker) getProcess(id string) (process *trackedProcess, ok bool) {
+	nw.processMapMutex.RLock()
+	process, ok = nw.processMap[id]
+	nw.processMapMutex.RUnlock()
 }
 
 type LaunchArgs struct {
@@ -143,7 +151,9 @@ func (nw *NodeWorker) Launch(args *LaunchArgs, reply *LaunchReply) error {
 		return err
 	}
 	log.Printf("launched %s: %d %s", id, cmd.Process.Pid, args.Name)
-	nw.processes[id] = newTrackedProcess(cmd)
+	nw.processMapMutex.Lock()
+	nw.processMap[id] = newTrackedProcess(cmd)
+	nw.processMapMutex.Unlock()
 	reply.ID = id
 	return nil
 }
@@ -163,7 +173,7 @@ func (reply *QueryReply) setProcess(tp *trackedProcess) {
 }
 
 func (nw *NodeWorker) findProcess(id string) (*trackedProcess, error) {
-	tp, ok := nw.processes[id]
+	tp, ok := nw.getProcess(id)
 	if !ok {
 		return nil, fmt.Errorf("No such process: %v", id)
 	}
