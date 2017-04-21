@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -93,25 +94,19 @@ func newTrackedProcess(startedCommand *exec.Cmd) *trackedProcess {
 type NodeWorker struct {
 	name      string
 	processes map[string]*trackedProcess
-	count     chan int
+	counter   int32
 }
 
 func NewNodeWorker() *NodeWorker {
 	nw := &NodeWorker{
 		name:      nodename,
 		processes: make(map[string]*trackedProcess),
-		count:     make(chan int),
 	}
-	go func() {
-		for i := 0; true; i++ {
-			nw.count <- i
-		}
-	}()
 	return nw
 }
 
 func (nw *NodeWorker) newProcessID() string {
-	return fmt.Sprintf("%v.%v", nw.name, <-nw.count)
+	return fmt.Sprintf("%v.%v", nw.name, atomic.AddInt32(&nw.counter, 1))
 }
 
 type LaunchArgs struct {
