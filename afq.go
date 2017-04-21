@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -285,7 +286,7 @@ func nodeWorkerMain() {
 type Resource struct {
 	max       int
 	available int
-	sync.Mutex
+	sync.RWMutex
 }
 
 // NewResource creates a new Resource with the specified number of units
@@ -296,6 +297,14 @@ func NewResource(max int) *Resource {
 // Max returns the maximum number of resource
 func (r *Resource) Max() int {
 	return r.max
+}
+
+// Available returns the amount of resource remaining
+func (r *Resource) Available() int {
+	r.RLock()
+	result := r.available
+	r.RUnlock()
+	return result
 }
 
 // TestAcquire tests whtehter the requested amount of resource is available
@@ -479,9 +488,34 @@ func (q *masterProcessQueue) Dequeue() *masterProcess {
 	return <-resultChan
 }
 
+type nodeQueue []*Node
+
+func (q nodeQueue) Len() int { return len(q) }
+
+func (q nodeQueue) Less(i, j int) bool {
+	return q[i].cpu.Available() > q[j].cpu.Available()
+}
+
+func (q nodeQueue) Swap(i, j int) {
+	q[i], q[j] = q[j], q[i]
+}
+
+func (q *nodeQueue) Push(x interface{}) {
+	typed := x.(*Node)
+	*q = append(*q, typed)
+}
+
+func (q *nodeQueue) Pop() interface{} {
+	old := *q
+	n := old.Len()
+	item := old[n-1]
+	*q = old[0 : n-1]
+	return item
+}
+
 // Master -- RPC Master
 type Master struct {
-	nodes            []*Node
+	nodes            nodeQueue
 	processes        []*masterProcess
 	processArrayLock sync.RWMutex
 	queue            *masterProcessQueue
@@ -664,20 +698,20 @@ func (m *Master) launchLoop() {
 		process := m.queue.Dequeue()
 		notify()
 		for _ = range recheck {
-			for _, node := range m.nodes {
-				acquired, remaining := node.cpu.TestAcquire(process.args.CPUs)
-				if acquired {
-					log.Printf("launch on %s, cpu: %v/%v", node.Name, remaining, node.cpu.Max())
-					go func() {
-						// release of resource is done in runOn()
-						process.runOn(node)
-						notify()
-					}()
-					goto doNext
-				}
+			node := m.nodes[0]
+			acquired, remaining := node.cpu.TestAcquire(process.args.CPUs)
+			if acquired {
+				heap.Fix(&m.nodes, 0)
+				log.Printf("launch on %s, cpu: %v/%v", node.Name, remaining, node.cpu.Max())
+				go func() {
+					// release of resource is done in runOn()
+					process.runOn(node)
+					notify()
+				}()
+				break
 			}
 		}
-	doNext:
+
 	}
 }
 
@@ -690,10 +724,9 @@ func masterMain() {
 
 	for _, node := range master.nodes {
 		node.startWorker()
-		if node.cpu.Max() > master.maxCPUPerNode {
-			master.maxCPUPerNode = node.cpu.Max()
-		}
 	}
+	sort.Sort(master.nodes)
+	master.maxCPUPerNode = master.nodes[0].cpu.Max()
 	log.Println("master running at port", port)
 
 	go master.launchLoop()
