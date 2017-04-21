@@ -337,6 +337,10 @@ type Node struct {
 	sshCmd *exec.Cmd
 }
 
+func (node *Node) String() string {
+	return fmt.Sprintf("[%v %v/%v]", node.Name, node.cpu.Available(), node.cpu.Max())
+}
+
 func (node *Node) startWorker() {
 	localname, err := os.Hostname()
 	if err != nil {
