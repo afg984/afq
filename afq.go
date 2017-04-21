@@ -14,7 +14,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"reflect"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -282,63 +281,18 @@ func nodeWorkerMain() {
 	rpcMain(NewNodeWorker())
 }
 
-// Resource represents CPU, memory, etc
-type Resource struct {
-	max       int
-	available int
-	sync.RWMutex
-}
-
-// NewResource creates a new Resource with the specified number of units
-func NewResource(max int) *Resource {
-	return &Resource{max: max, available: max}
-}
-
-// Max returns the maximum number of resource
-func (r *Resource) Max() int {
-	return r.max
-}
-
-// Available returns the amount of resource remaining
-func (r *Resource) Available() int {
-	r.RLock()
-	result := r.available
-	r.RUnlock()
-	return result
-}
-
-// TestAcquire tests whtehter the requested amount of resource is available
-// if yes, acquires the resource
-// returns whether the resource is acquired and the amount remaining
-func (r *Resource) TestAcquire(amount int) (bool, int) {
-	r.Lock()
-	defer r.Unlock()
-	if r.available >= amount {
-		r.available -= amount
-		return true, r.available
-	}
-	return false, r.available
-}
-
-// Release the specified amount of resource, returns the amount available
-func (r *Resource) Release(amount int) (remaining int) {
-	r.Lock()
-	r.available += amount
-	remaining = r.available
-	r.Unlock()
-	return
-}
-
 // Node -- master abstraction of a node worker
 type Node struct {
-	Name   string
-	cpu    *Resource
-	rpc    *rpc.Client
-	sshCmd *exec.Cmd
+	Name    string
+	MaxCPU  int
+	freeCPU int
+	rpc     *rpc.Client
+	sshCmd  *exec.Cmd
+	index   int // tracking index at nodeQueue
 }
 
 func (node *Node) String() string {
-	return fmt.Sprintf("[%v %v/%v]", node.Name, node.cpu.Available(), node.cpu.Max())
+	return fmt.Sprintf("{%v %v/%v}", node.Name, node.MaxCPU-node.freeCPU, node.MaxCPU)
 }
 
 func (node *Node) startWorker() {
@@ -419,8 +373,6 @@ func (process *masterProcess) runOn(node *Node) {
 	if err != nil {
 		panic(err)
 	}
-	remaining := node.cpu.Release(process.args.CPUs)
-	log.Printf("node %v process exited, cpu: %v/%v", node.Name, remaining, node.cpu.Max())
 	process.exitStatus = waitReply.ExitStatus
 	close(process.exited)
 }
@@ -497,11 +449,13 @@ type nodeQueue []*Node
 func (q nodeQueue) Len() int { return len(q) }
 
 func (q nodeQueue) Less(i, j int) bool {
-	return q[i].cpu.Available() > q[j].cpu.Available()
+	return q[i].freeCPU > q[j].freeCPU
 }
 
 func (q nodeQueue) Swap(i, j int) {
 	q[i], q[j] = q[j], q[i]
+	q[i].index = i
+	q[j].index = j
 }
 
 func (q *nodeQueue) Push(x interface{}) {
@@ -520,6 +474,7 @@ func (q *nodeQueue) Pop() interface{} {
 // Master -- RPC Master
 type Master struct {
 	nodes            nodeQueue
+	nodeLock         sync.Mutex
 	processes        []*masterProcess
 	processArrayLock sync.RWMutex
 	queue            *masterProcessQueue
@@ -536,6 +491,29 @@ type LaunchArgs struct {
 type LaunchReply struct {
 	// The ID on the master, this is unlikely to be the same as the one on the node
 	ID string `json:"id"`
+}
+
+// requestNode withCPU number
+func (m *Master) requestNode(withCPU int) *Node {
+	m.nodeLock.Lock()
+	defer m.nodeLock.Unlock()
+	node := m.nodes[0]
+	if node.freeCPU < withCPU {
+		return nil
+	}
+	node.freeCPU -= withCPU
+	heap.Fix(&m.nodes, node.index)
+	log.Printf("request %s(%d) => %v", node.Name, withCPU, m.nodes)
+	return node
+}
+
+// update a node after it is modified
+func (m *Master) releaseNode(node *Node, releaseCPU int) {
+	m.nodeLock.Lock()
+	node.freeCPU += releaseCPU
+	heap.Fix(&m.nodes, node.index)
+	log.Printf("release %s(%d) => %v", node.Name, releaseCPU, m.nodes)
+	m.nodeLock.Unlock()
 }
 
 // Submit a process
@@ -680,8 +658,9 @@ func getNodesFromMachineFile(filename string) (result []*Node) {
 			log.Fatalf("bad word (cpus): %q", scanner.Text())
 		}
 		result = append(result, &Node{
-			Name: hostname,
-			cpu:  NewResource(cpucount),
+			Name:    hostname,
+			MaxCPU:  cpucount,
+			freeCPU: cpucount,
 		})
 	}
 	if err := scanner.Err(); err != nil {
@@ -702,14 +681,12 @@ func (m *Master) launchLoop() {
 		process := m.queue.Dequeue()
 		notify()
 		for _ = range recheck {
-			node := m.nodes[0]
-			acquired, remaining := node.cpu.TestAcquire(process.args.CPUs)
-			if acquired {
-				heap.Fix(&m.nodes, 0)
-				log.Printf("launch on %s, cpu: %v/%v", node.Name, remaining, node.cpu.Max())
+			node := m.requestNode(process.args.CPUs)
+			if node != nil {
 				go func() {
 					// release of resource is done in runOn()
 					process.runOn(node)
+					m.releaseNode(node, process.args.CPUs)
 					notify()
 				}()
 				break
@@ -726,12 +703,14 @@ func masterMain() {
 	}
 	go rpcMain(&master, NewNodeWorker())
 
-	for _, node := range master.nodes {
+	for index, node := range master.nodes {
 		node.startWorker()
+		node.index = index
 	}
-	sort.Sort(master.nodes)
-	master.maxCPUPerNode = master.nodes[0].cpu.Max()
+	heap.Init(&master.nodes)
+	master.maxCPUPerNode = master.nodes[0].MaxCPU
 	log.Println("master running at port", port)
+	log.Println(master.nodes)
 
 	go master.launchLoop()
 
